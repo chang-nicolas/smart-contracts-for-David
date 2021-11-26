@@ -7,12 +7,13 @@ import "./IERC20.sol";
 import "./SafeERC20.sol";
 import "./IERC721.sol";
 import "./IERC721Receiver.sol";
-
+import "./ERC1155.sol";
+import "./ERC1155Holder.sol";
+import "./ERC165Checker.sol";
 pragma solidity ^0.8.0;
 
-contract Bidify is ReentrancyGuard, Ownable, IERC165 {
+contract Bidify is ReentrancyGuard, Ownable, IERC165, ERC1155Holder {
   using SafeERC20 for IERC20;
-
   // All prices will now be 0.0001, 0.0002, 0.0010...
   // For coins with less accuracy, such as USD stablecoins, it'll be 0.01, 0.02...
   uint8 constant DECIMAL_ACCURACY = 4;
@@ -26,7 +27,7 @@ contract Bidify is ReentrancyGuard, Ownable, IERC165 {
   struct Listing {
     address creator;
     address currency;
-    IERC721 platform;
+    address platform;
     uint256 token;
     uint256 price;
     address referrer;
@@ -35,6 +36,7 @@ contract Bidify is ReentrancyGuard, Ownable, IERC165 {
     address highBidder;
     uint256 endTime;
     bool paidOut;
+    bool isERC721;
   }
 
   mapping(uint256 => Listing) private _listings;
@@ -59,15 +61,19 @@ contract Bidify is ReentrancyGuard, Ownable, IERC165 {
   constructor() Ownable() {}
 
   // Support receiving NFTs
-  function supportsInterface(bytes4 interfaceId) external pure override returns (bool) {
-    return interfaceId == 0x150b7a02;
-  }
+  // function supportsInterface(bytes4 interfaceId) external pure override returns (bool) {
+  //   return interfaceId == 0x150b7a02;
+  // }
   function onERC721Received(address operator, address, uint256 tokenId, bytes calldata) external returns (bytes4) {
     require(operator == address(this), "someone else sent us a NFT");
     _lastReceived = tokenId;
     return IERC721Receiver.onERC721Received.selector;
   }
-
+  function onERC1155Received(address operator, address, uint256 tokenId, bytes calldata) external returns (bytes4) {
+    require(operator == address(this), "someone else sent us a NFT");
+    _lastReceived = tokenId;
+    return IERC1155Receiver.onERC1155Received.selector;
+  }
   // Get the minimum accuracy unit for a given accuracy
   function getPriceUnit(address currency) public view returns (uint256) {
     if (currency == address(0)) {
@@ -119,16 +125,18 @@ contract Bidify is ReentrancyGuard, Ownable, IERC165 {
   function getListing(uint256 id) external view returns (Listing memory) {
     return _listings[id];
   }
-
-  function list(address currency, IERC721 platform, uint256 token, uint256 price,
-                  uint8 timeInDays, address referrer, bool allowMarketplace) external nonReentrant returns (uint64) {
+  
+  function list(address currency, address platform, uint256 token, uint256 price,
+                  uint8 timeInDays, address referrer, bool allowMarketplace, bool isERC721) external nonReentrant returns (uint64) {
     // Make sure platform is a valid ERC721 contract
-    // The usage of safeTransferFrom should handle this, but this never hurts
-    require(platform.supportsInterface(0x80ac58cd), "platform isn't an ERC721 contract");
-
+    // The usage of safeTransferFrom should handle this, but this never 
+    // require(platform.supportsInterface(0x80ac58cd), "platform isn't an ERC721 contract");
+    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    //require( !isERC1155(platform) || platform.supportsInterface(0x80ac58cd), "platform isn't an ERC721 or ERC1155 contract");
+    
     uint256 unit = getPriceUnit(currency);
     // Minimum price check to ensure getNextBid doesn't flatline
-    require(price >= (20 * unit), "price is too low");
+    //require(price >= (20 * unit), "price is too low");
     // Ensure it's a multiple of the price unit
     require(((price / unit) * unit) == price, "price isn't a valid multiple of this currency's price unit");
     require(timeInDays <= 30, "auction is too long");
@@ -138,22 +146,42 @@ contract Bidify is ReentrancyGuard, Ownable, IERC165 {
 
     // Re-entrancy opportunity
     // Given the usage of _lastReceived when we create the listing object, this does need the guard
-    platform.safeTransferFrom(msg.sender, address(this), token);
-
-    _listings[id] = Listing(
-      msg.sender,
-      currency,
-      platform,
-      _lastReceived,
-      price,
-      referrer,
-      allowMarketplace,
-      address(0),
-      address(0),
-      block.timestamp + (timeInDays * (1 days)),
-      false
-    );
-    emit ListingCreated(id, msg.sender, currency, address(platform), token, price, timeInDays, referrer);
+    if(isERC721)
+    {
+      IERC721(platform).safeTransferFrom(msg.sender, address(this), token);
+      _listings[id] = Listing(
+        msg.sender,
+        currency,
+        platform,
+        token,
+        price,
+        referrer,
+        allowMarketplace,
+        address(0),
+        address(0),
+        block.timestamp + (timeInDays * (10 minutes)),
+        false,
+        true
+      );
+    }
+    else {
+      IERC1155(platform).safeTransferFrom(msg.sender, address(this), token, 1, "");
+      _listings[id] = Listing(
+        msg.sender,
+        currency,
+        platform,
+        token,
+        price,
+        referrer,
+        allowMarketplace,
+        address(0),
+        address(0),
+        block.timestamp + (timeInDays * (10 minutes)),
+        false,
+        false
+      );
+    }
+    emit ListingCreated(id, msg.sender, currency, platform, token, price, timeInDays, referrer);
 
     return id;
   }
@@ -168,8 +196,7 @@ contract Bidify is ReentrancyGuard, Ownable, IERC165 {
     if (listing.highBidder == address(0)) {
       return listing.price;
     }
-    uint256 round = getPriceUnit(listing.currency);
-    return ((listing.price + (listing.price / 20)) / round) * round;
+    return listing.price + listing.price / 20;
   }
 
   function bid(uint64 id, address marketplace, uint256 amount) external payable nonReentrant {
@@ -185,7 +212,7 @@ contract Bidify is ReentrancyGuard, Ownable, IERC165 {
     }
 
     uint256 nextBid = getNextBid(id);
-    require(nextBid < amount, "Bid amount should be more than Next bid amount");
+    require(nextBid <= amount, "Bid amount should not be less than Next bid amount");
     // This loses control of execution, yet no variables are set yet
     // This means no interim state will be represented if asked
     // Combined with the re-entrancy guard, this is secure
@@ -274,8 +301,10 @@ contract Bidify is ReentrancyGuard, Ownable, IERC165 {
       nftRecipient = listing.creator;
       sellPrice = 0;
     }
-
-    listing.platform.safeTransferFrom(address(this), nftRecipient, listing.token);
+    if(listing.isERC721)
+      IERC721(listing.platform).safeTransferFrom(address(this), nftRecipient, listing.token);
+    else
+      IERC1155(listing.platform).safeTransferFrom(address(this), nftRecipient, listing.token, 1, "");
     emit AuctionFinished(id, nftRecipient, sellPrice);
   }
 }
